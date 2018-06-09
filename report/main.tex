@@ -1,0 +1,153 @@
+\documentclass{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[francais]{babel}
+
+\usepackage[nameinlink,capitalize]{cleveref}
+
+\usepackage{listings}
+\lstset{
+%  numbers=left,
+%  firstnumber=1,
+}
+
+\usepackage{hyperref}
+
+\usepackage[vlined,linesnumbered]{algorithm2e}
+  \SetKwProg{Fn}{Function}{}{}
+
+\usepackage{verbatim}
+
+\usepackage{geometry}
+  \geometry{hmargin=3.5cm,vmargin=3.5cm}
+
+\usepackage{amsfonts}
+\usepackage{amsthm}
+\usepackage{minted}
+\usepackage{amsmath}
+
+\title{Calcul parallèle - TP 2: Correcteur de mots}
+\author{Adrien Stalain et Vincent Tourneur}
+
+\begin{document}
+
+\maketitle
+
+\section{Structure de données principale}
+
+Les fichiers qui sont décrits dans cette section sont:
+\begin{itemize}
+	\item \texttt{src/atd/advanced\_trie.hpp}
+	\item \texttt{src/atd/advanced\_trie.cpp}
+\end{itemize}
+
+Pour stoquer les mots du dictionnaire, nous utilisons un \texttt{trie}. Tous
+les algorithmes utilisés pour la recherche de mots, l'ajout et la suppression
+n'utilisent aucun vérou (\texttt{lock-free}). Nous utilisons à la place des
+\texttt{std::atomic}, en spécifiant le \texttt{memory order} à chaque
+écriture/lecture pour avoir de bonnes performances.
+
+Chaque noeud contient une lettre, un booléen qui indique si le mot formé depuis
+la racine de l'arbre est valide et la liste de ses fils:
+\begin{minted}{c++}
+class advanced_trie
+{
+	using childs_t = std::array<std::atomic<advanced_trie*>, 'z' - 'a' + 1>;
+	childs_t childs_;
+	advanced_trie* parent_;
+	char my_char_; // Only if there is a parent
+	std::atomic<bool> word_end_;
+}
+\end{minted}
+
+La liste des fils est enregistrée dans un \texttt{std::array}, qui a comme
+taille 26, c'est-à-dire le nombre maximum de fils possible, si la node n'as pas 
+26 fils, le tableau est \texttt{null-terminated}.
+
+Lors d'un ajout de mot, nous parcourons l'arbre, et à partir du moment où le
+noeud recherché n'existe pas, nous créons entièrement la nouvelle branche avant
+de l'attacher au reste de l'arbre. Cette opération est faite de façon atomique,
+avec un \texttt{compare\_exchange\_strong}, au cas où un autre \texttt{thread}
+a rattaché une autre branche au même endroit juste avant. Le booléen
+\texttt{word\_end\_} est mis à \texttt{true} sur la feuille de cette branche.
+Si la branche existait déjà entièrement, le booléen du dernier noeud de la branche
+est mis à \texttt{true}, il n'est pas nécessaire de créer des noeuds.
+
+Pour l'opération de suppression, nous parcourons la branche de l'arbre correspondant
+au mot, puis le booléen \texttt{word\_end\_} est mis à \texttt{false}. Si la
+branche n'existe pas, la fonction s'arrête.
+
+L'opération de recherche est décrite dans la section suivante.
+
+\section{Algorithme principal}
+
+Les fichiers qui sont décrits dans cette section sont:
+\begin{itemize}
+	\item \texttt{src/advanced\_trie\_dictionary.cpp}
+	\item \texttt{src/atd/task.hpp}
+	\item \texttt{src/atd/task\_stack.hpp}
+\end{itemize}
+
+La recherche de mots est faite en calculant la distance de Levenstein entre le
+mot recherché et les mots contenus dans l'arbre. Les calculs sont faits en
+remplissant des vecteurs, dont la case $n$ correspond à la distance avec le
+préfixe de $n$ lettres du mot recherché. Nous commençons par la racine de
+l'arbre, qui correspond au mot vide.
+
+Descendre dans l'arbre correspond à remplir un nouveau vecteur. Pour cela,
+nous avons besoin des deux précédents vecteurs, car pour remplir la prochaine
+case du vecteur courant, nous avons besoin de la valeur de la case précédente,
+des valeurs des cases actuelle et précédente du précédent vecteur, et au cas
+où un échange de lettre est requis, de la deuxième précédente case du deuxième
+précedent vecteur.
+
+Nous appelons une tâche l'action de remplir un vecteur, et ces tâches sont
+stoquées dans des piles de tâches pour permettre de faire facilement des
+parcours autres que profondeur de l'arbre. Chaque tâche, après avoir remplit
+son vecteur, va créer des nouvelles tâches qui correspondent aux fils du noeud.
+
+Nous stoquons les tâches dans deux piles différentes: lorsqu'une tâche calcule
+la dernière valeur de son vecteur (qui correspond à la distance entre le mot
+recherché et le mot qui correspond au noeud de l'arbre), celle-ci peut avoir
+seulement deux valeurs: soit la même valeur que la dernière case du vecteur
+précedent, soit cette valeur plus un.
+
+Dans le premier cas, la tâche est ajoutées dans la première pile, et dans le
+second cas, dans la deuxième pile. L'ordre de traitement des tâches est le
+suivant: les tâches de la première pile sont exécutées, jusqu'à ce qu'elle soit
+vide, puis les deux piles sont échangées (donc la première pile reçoit le contenu
+de la deuxième pile, et cette dernière devient la pile vide).
+
+Lorsque la tâche courrante correspond à un mot valide du dictionnaire,
+nous testons si sa distance est plus faible que la meilleure connue, et
+si c'est le cas nous l'enregistrons. S'il ne reste aucune tâche à explorer
+qui pourrait faire baisser la distance minimale connue, nous arrêtons le parcours.
+La distance la plus faible et le mot associé sont retournés.
+
+Cet ordre de traitement nous permet d'éviter d'aller parcourir des longues
+branches de l'arbre qui contiennent des mots très différents de celui recherché.
+Cela permet des recherches rapides, surtout quand la distance est faible.
+
+\section{Optimisations mémoire}
+Les fichiers qui sont décrits dans cette section sont:
+\begin{itemize}
+	\item \texttt{src/atd/line.hpp}
+	\item \texttt{src/atd/linepool.hpp}
+	\item \texttt{src/atd/linepool.cpp}
+\end{itemize}
+
+Notre parcours de \texttt{trie} est relativement coûteux en mémoire
+(jusqu'à $26^{dist}$ vecteurs en mémoire), et il y a de nombreuses allocations
+mémoires pour peu de déallocations. C'est pour cela que l'on a choisi de faire
+un sytème d'allocation personnalisé.
+
+L'allocateur personalisé est basé sur une \texttt{memory pool},
+il nous donne plusieurs avantages:
+\begin{itemize}
+  \item On réduit le coup d'allocation de la biblothèque standard.
+  \item On n'utilise pas de \texttt{std::shared\_ptr} et leur coût
+	  (\texttt{thread safety} / \texttt{reference counting}).
+  \item On n'appelle pas les destructeurs.
+\end{itemize}
+
+\end{document}
